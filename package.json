@@ -5,6 +5,7 @@
   "scripts": {
     "starthttp": "ts-node --files ./src/server.ts",
     "startsocket": "ts-node ./src/socket_server.ts",
+    "startbsd": "ts-node ./src/bsd_server.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
