@@ -6,8 +6,9 @@ import { ProtocolCodec, Message, MessageType, createConnectMessage, createChatMe
  * BSD Socket 客户端配置选项
  */
 export interface ClientOptions {
-  host: string;
-  port: number;
+  host?: string;              // TCP 主机（可选，与 unixPath 二选一）
+  port?: number;              // TCP 端口（可选，与 unixPath 二选一）
+  unixPath?: string;          // Unix Domain Socket 路径（可选，与 host/port 二选一）
   reconnect?: boolean;
   reconnectInterval?: number;
   maxReconnectAttempts?: number;
@@ -42,6 +43,7 @@ export class BSDSocketClient extends EventEmitter {
   /**
    * 创建套接字并连接到服务器 (BSD 风格 API)
    * 合并 socket() + connect()
+   * 支持 TCP 或 Unix Domain Socket
    */
   connect(token?: string): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -50,10 +52,20 @@ export class BSDSocketClient extends EventEmitter {
         return;
       }
 
-      this.socket = createConnection({
-        host: this.options.host,
-        port: this.options.port
-      });
+      // 检查配置
+      if (this.options.unixPath) {
+        // Unix Domain Socket 模式
+        this.socket = createConnection(this.options.unixPath);
+      } else if (this.options.host && this.options.port) {
+        // TCP 模式
+        this.socket = createConnection({
+          host: this.options.host,
+          port: this.options.port
+        });
+      } else {
+        reject(new Error('必须指定 unixPath 或 host+port'));
+        return;
+      }
 
       // 连接成功
       this.socket.on('connect', () => {

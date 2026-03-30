@@ -1,51 +1,131 @@
+/**
+ * BSD Socket 服务器 - 自定义 IPC 版本
+ * 
+ * 使用 IPCChannel 替代 EventEmitter
+ * 实现更纯粹、更可控的消息收发机制
+ */
+
 import { createServer, Server as NetServer, Socket as NetSocket } from 'net';
-import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import { BSDSocket } from './socket';
 import { Message, MessageType, createConnectAckMessage, createErrorMessage } from './protocol';
+import { IPCChannel, IPCMessage, createIPCChannel } from './ipc';
 
 /**
  * BSD Socket 服务器配置选项
  */
 export interface ServerOptions {
-  port?: number;              // TCP 端口（可选，与 unixPath 二选一）
-  unixPath?: string;          // Unix Domain Socket 路径（可选，与 port 二选一）
+  port?: number;
+  unixPath?: string;
   host?: string;
   backlog?: number;
   heartbeatInterval?: number;
   heartbeatTimeout?: number;
   maxConnections?: number;
-  socketMode?: number;        // Unix Socket 权限模式，默认 0o666
+  socketMode?: number;
 }
 
 /**
- * BSD Socket 服务器类
- * 实现 BSD 风格的 Socket API: socket() -> bind() -> listen() -> accept()
+ * 服务器事件类型
  */
-export class BSDSocketServer extends EventEmitter {
+export type ServerEventType = 
+  | 'listening' 
+  | 'ready' 
+  | 'connection' 
+  | 'message' 
+  | 'disconnect' 
+  | 'timeout' 
+  | 'reject' 
+  | 'error' 
+  | 'socket_error' 
+  | 'close';
+
+/**
+ * 服务器事件载荷类型
+ */
+export interface ServerEventMap {
+  listening: { address?: string; port?: number; unixPath?: string; mode: string; socketMode?: number };
+  ready: void;
+  connection: BSDSocket;
+  message: { socket: BSDSocket; message: Message };
+  disconnect: { socketId: string; hadError: boolean };
+  timeout: { socketId: string };
+  reject: { reason: string };
+  error: Error;
+  socket_error: { socketId: string; error: Error };
+  close: void;
+}
+
+/**
+ * BSD Socket 服务器类 - IPC 版本
+ * 使用自定义 IPCChannel 替代 EventEmitter
+ */
+export class BSDSocketServerIPC {
   private server: NetServer | null = null;
   private options: ServerOptions;
   private connections: Map<string, BSDSocket> = new Map();
   private running: boolean = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  
+  // 使用自定义 IPCChannel 替代 EventEmitter
+  private ipcChannel: IPCChannel;
 
   constructor(options: ServerOptions) {
-    super();
     this.options = {
       host: '0.0.0.0',
       backlog: 511,
-      heartbeatInterval: 30000,  // 默认 30 秒心跳
-      heartbeatTimeout: 60000,   // 默认 60 秒超时
+      heartbeatInterval: 30000,
+      heartbeatTimeout: 60000,
       maxConnections: 1000,
-      ...options
+      socketMode: 0o666,
+      ...options,
     };
+    
+    // 初始化 IPC 通道
+    this.ipcChannel = createIPCChannel({
+      catchErrors: true,
+      onError: (error, message) => {
+        console.error(`[BSDSocketServerIPC] IPC Error:`, error, message);
+      },
+    });
   }
 
   /**
-   * 创建套接字并绑定端口 (BSD 风格 API)
-   * 合并 socket() + bind()
-   * 支持 TCP 端口或 Unix Domain Socket
+   * 订阅服务器事件
+   * @param event 事件类型
+   * @param handler 事件处理器
+   * @returns 取消订阅函数
+   */
+  on<T extends ServerEventType>(
+    event: T,
+    handler: (payload: ServerEventMap[T]) => void | Promise<void>
+  ): () => void {
+    return this.ipcChannel.subscribe(event, handler as any);
+  }
+
+  /**
+   * 一次性订阅事件
+   */
+  once<T extends ServerEventType>(
+    event: T,
+    handler: (payload: ServerEventMap[T]) => void | Promise<void>
+  ): void {
+    this.ipcChannel.once(event, handler as any);
+  }
+
+  /**
+   * 发布事件（内部使用）
+   */
+  private emit<T extends ServerEventType>(
+    event: T,
+    payload: ServerEventMap[T]
+  ): void {
+    this.ipcChannel.publish(event, payload, 'BSDSocketServerIPC');
+  }
+
+  /**
+   * 创建套接字并绑定
    */
   createAndBind(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -54,7 +134,6 @@ export class BSDSocketServer extends EventEmitter {
         return;
       }
 
-      // 检查配置
       if (!this.options.port && !this.options.unixPath) {
         reject(new Error('必须指定 port 或 unixPath'));
         return;
@@ -67,12 +146,9 @@ export class BSDSocketServer extends EventEmitter {
         reject(err);
       });
 
-      // 根据配置选择监听方式
       if (this.options.unixPath) {
-        // Unix Domain Socket 模式
         this.createUnixSocket(resolve, reject);
       } else {
-        // TCP 模式
         this.createTcpSocket(resolve, reject);
       }
     });
@@ -90,7 +166,7 @@ export class BSDSocketServer extends EventEmitter {
         this.emit('listening', {
           address: this.options.host,
           port: this.options.port,
-          mode: 'tcp'
+          mode: 'tcp',
         });
         resolve();
       }
@@ -99,12 +175,10 @@ export class BSDSocketServer extends EventEmitter {
 
   /**
    * 创建 Unix Domain Socket
-   * 宿主 IPC 直通模式
    */
   private createUnixSocket(resolve: () => void, reject: (err: Error) => void): void {
     const unixPath = this.options.unixPath!;
 
-    // 确保目录存在
     const dir = path.dirname(unixPath);
     if (!fs.existsSync(dir)) {
       try {
@@ -115,7 +189,6 @@ export class BSDSocketServer extends EventEmitter {
       }
     }
 
-    // 清理已存在的 socket 文件
     if (fs.existsSync(unixPath)) {
       try {
         fs.unlinkSync(unixPath);
@@ -126,27 +199,24 @@ export class BSDSocketServer extends EventEmitter {
     }
 
     this.server!.listen(unixPath, () => {
-      // 设置 socket 文件权限，确保其他进程可访问
       const mode = this.options.socketMode || 0o666;
       try {
         fs.chmodSync(unixPath, mode);
       } catch (err) {
-        // 权限设置失败不影响服务启动，记录警告
         console.warn(`设置 socket 权限失败: ${unixPath}`);
       }
 
       this.emit('listening', {
         unixPath: unixPath,
         mode: 'unix',
-        socketMode: mode
+        socketMode: mode,
       });
       resolve();
     });
   }
 
   /**
-   * 监听连接 (BSD 风格 API)
-   * 对应 listen() + accept()
+   * 监听连接
    */
   listen(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -160,17 +230,13 @@ export class BSDSocketServer extends EventEmitter {
         return;
       }
 
-      // 处理新连接
       this.server.on('connection', (netSocket: NetSocket) => {
         this.handleConnection(netSocket);
       });
 
       this.running = true;
-
-      // 启动心跳检测
       this.startHeartbeat();
-
-      this.emit('ready');
+      this.emit('ready', undefined);
       resolve();
     });
   }
@@ -179,7 +245,6 @@ export class BSDSocketServer extends EventEmitter {
    * 处理新连接
    */
   private handleConnection(netSocket: NetSocket): void {
-    // 检查最大连接数
     if (this.connections.size >= (this.options.maxConnections || 1000)) {
       netSocket.end(createErrorMessage(503, '服务器连接数已满'));
       netSocket.destroy();
@@ -187,17 +252,13 @@ export class BSDSocketServer extends EventEmitter {
       return;
     }
 
-    // 创建 BSDSocket 包装
     const socket = new BSDSocket(netSocket);
     const socketId = socket.getId();
 
-    // 存储连接
     this.connections.set(socketId, socket);
-
-    // 发送连接成功响应
     socket.sendMessage(createConnectAckMessage(true, '连接成功')).catch(() => {});
 
-    // 触发连接事件
+    // 使用 IPC 发布连接事件
     this.emit('connection', socket);
 
     // 监听消息
@@ -216,20 +277,18 @@ export class BSDSocketServer extends EventEmitter {
       this.emit('socket_error', { socketId, error: err });
     });
 
-    // 设置保活
     socket.setKeepAlive(true, 30000);
   }
 
   /**
-   * 接受连接事件 (BSD 风格 API)
-   * 使用 on('connection', callback) 替代
+   * 接受连接事件
    */
-  onConnection(callback: (socket: BSDSocket) => void): void {
-    this.on('connection', callback);
+  onConnection(callback: (socket: BSDSocket) => void): () => void {
+    return this.on('connection', callback);
   }
 
   /**
-   * 广播消息给所有连接
+   * 广播消息
    */
   broadcast(data: Buffer | string, excludeSocketId?: string): void {
     for (const [id, socket] of this.connections) {
@@ -243,7 +302,7 @@ export class BSDSocketServer extends EventEmitter {
   }
 
   /**
-   * 广播消息对象给所有连接
+   * 广播消息对象
    */
   broadcastMessage(message: Buffer, excludeSocketId?: string): void {
     this.broadcast(message, excludeSocketId);
@@ -271,7 +330,7 @@ export class BSDSocketServer extends EventEmitter {
   }
 
   /**
-   * 关闭服务器 (BSD 风格 API)
+   * 关闭服务器
    */
   close(): Promise<void> {
     return new Promise((resolve) => {
@@ -282,25 +341,21 @@ export class BSDSocketServer extends EventEmitter {
 
       this.running = false;
 
-      // 停止心跳检测
       if (this.heartbeatTimer) {
         clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
       }
 
-      // 关闭所有连接
       for (const socket of this.connections.values()) {
         socket.close().catch(() => {});
       }
       this.connections.clear();
 
-      // 关闭服务器
       this.server.close(() => {
-        this.emit('close');
+        this.emit('close', undefined);
         resolve();
       });
 
-      // 强制关闭超时
       setTimeout(() => {
         if (this.server) {
           this.server.unref();
@@ -324,7 +379,6 @@ export class BSDSocketServer extends EventEmitter {
 
       for (const [id, socket] of this.connections) {
         if (socket.isTimeout(timeout)) {
-          // 超时，关闭连接
           socket.close().catch(() => {});
           this.connections.delete(id);
           this.emit('timeout', { socketId: id });
@@ -347,7 +401,7 @@ export class BSDSocketServer extends EventEmitter {
     return {
       address: this.options.host || '0.0.0.0',
       port: this.options.port || 0,
-      unixPath: this.options.unixPath
+      unixPath: this.options.unixPath,
     };
   }
 
@@ -356,5 +410,19 @@ export class BSDSocketServer extends EventEmitter {
    */
   isUnixSocket(): boolean {
     return !!this.options.unixPath;
+  }
+
+  /**
+   * 获取 IPC 统计信息
+   */
+  getIPCStats() {
+    return this.ipcChannel.getStats();
+  }
+
+  /**
+   * 销毁服务器
+   */
+  destroy(): void {
+    this.ipcChannel.destroy();
   }
 }
